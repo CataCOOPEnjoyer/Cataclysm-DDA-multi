@@ -187,8 +187,10 @@ jobs:
           # Link SDL & co. dynamically (DLLs bundled by the Package ZIP step):
           # MSYS2's current static SDL2_image/SDL2_mixer archives can't be fully
           # static-linked anymore (__imp_ refs to avif/jxl/flac/gme/xmp).
-          sed -i 's/^    LDFLAGS += -static$/    LDFLAGS += -static-libgcc -static-libstdc++/' Makefile
-          grep -n 'LDFLAGS += -static-libgcc -static-libstdc++' Makefile
+          sed -i -E 's/^    LDFLAGS \+= -static(\r?)$/    LDFLAGS += -static-libgcc -static-libstdc++ -DYNLINK-MARKER\1/' Makefile
+          grep -q 'DYNLINK-MARKER' Makefile || { echo 'static-link line not found'; exit 1; }
+          sed -i 's/ -DYNLINK-MARKER//' Makefile
+          grep -n 'static-libgcc' Makefile
 
       - uses: ./.github/actions/build-windows
         with:
