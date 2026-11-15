@@ -1,0 +1,531 @@
+diff --git a/data/raw/keybindings.json b/data/raw/keybindings.json
+index ddec569..5fa8d25 100644
+--- a/data/raw/keybindings.json
++++ b/data/raw/keybindings.json
+@@ -5607,6 +5607,13 @@
+     "category": "DEFAULTMODE",
+     "bindings": [ ]
+   },
++  {
++    "type": "keybinding",
++    "id": "coop_peace_toggle",
++    "name": "Co-op: мирний / бойовий режим",
++    "category": "DEFAULTMODE",
++    "bindings": [ { "input_method": "keyboard_any", "key": "F7" } ]
++  },
+   {
+     "type": "keybinding",
+     "id": "copy_join_address",
+diff --git a/src/action.cpp b/src/action.cpp
+index ac2f669..1c30d3f 100644
+--- a/src/action.cpp
++++ b/src/action.cpp
+@@ -409,6 +409,8 @@ std::string action_ident( action_id act )
+             return "high_five";
+         case ACTION_COOP_CHAT:
+             return "coop_chat";
++        case ACTION_COOP_PEACE_TOGGLE:
++            return "coop_peace_toggle";
+         case ACTION_COPY_JOIN_ADDRESS:
+             return "copy_join_address";
+         case ACTION_NULL:
+@@ -988,6 +990,7 @@ action_id handle_action_menu( map &here )
+             REGISTER_ACTION( ACTION_TOGGLE_DEBUG_MODE );
+         } else if( category == _( "Interact" ) ) {
+             REGISTER_ACTION( ACTION_COOP_CHAT );
++            REGISTER_ACTION( ACTION_COOP_PEACE_TOGGLE );
+             REGISTER_ACTION( ACTION_EXAMINE );
+             REGISTER_ACTION( ACTION_EXAMINE_AND_PICKUP );
+             REGISTER_ACTION( ACTION_SMASH );
+diff --git a/src/action.h b/src/action.h
+index 3107e63..521e973 100644
+--- a/src/action.h
++++ b/src/action.h
+@@ -364,6 +364,8 @@ enum action_id : int {
+     ACTION_HIGH_FIVE,
+     /** MP: open the co-op text-chat prompt */
+     ACTION_COOP_CHAT,
++    /** MP: toggle the shared peace (free movement) / combat (strict turns) mode */
++    ACTION_COOP_PEACE_TOGGLE,
+     /** MP: copy the host's join address to the clipboard (streaming-privacy hide-IP option) */
+     ACTION_COPY_JOIN_ADDRESS,
+     /** Not an action, serves as count of enumerated actions */
+diff --git a/src/do_turn.cpp b/src/do_turn.cpp
+index 7525895..15d3dbf 100644
+--- a/src/do_turn.cpp
++++ b/src/do_turn.cpp
+@@ -373,6 +373,9 @@ void handle_key_blocking_activity( int timeout )
+             // MP-locked host: let the host send chat while waiting for the client
+             // (the key was otherwise swallowed here before reaching handle_action).
+             cata_mp::mp_open_chat();
++        } else if( action == "coop_peace_toggle" ) {
++            // Same for the peace/combat toggle: usable while locked.
++            cata_mp::mp_peace_toggle();
+         } else if( action != "HELP_KEYBINDINGS" ) {
+             refresh = false;
+         }
+@@ -912,6 +915,9 @@ bool game::do_turn()
+             std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
+         }
+     }
++    // MP peace mode: a client holding a banked window of AP must not pour it
++    // into an activity in one go (that would craft/read 50 turns instantly).
++    cata_mp::mp_peace_clamp_local_activity( u );
+     while( u.get_moves() > 0 && u.activity ) {
+         u.activity.do_turn( u );
+     }
+@@ -1091,6 +1097,7 @@ bool game::do_turn()
+                 const activity_id iter_pre_act = u.activity ? u.activity.id()
+                                                  : activity_id::NULL_ID();
+                 cata_mp::mp_client_note_input_loop_activity_start();
++                cata_mp::mp_peace_clamp_local_activity( u );
+                 while( u.get_moves() > 0 && u.activity ) {
+                     u.activity.do_turn( u );
+                 }
+diff --git a/src/game.cpp b/src/game.cpp
+index 71b632e..2be5ff8 100644
+--- a/src/game.cpp
++++ b/src/game.cpp
+@@ -2627,6 +2627,7 @@ input_context get_default_mode_input_context()
+         ctxt.register_action( "pass_item" );
+         ctxt.register_action( "high_five" );
+         ctxt.register_action( "coop_chat" );
++        ctxt.register_action( "coop_peace_toggle" );
+         ctxt.register_action( "copy_join_address" );
+         ctxt.register_action( "pick_style" );
+         ctxt.register_action( "reload_item" );
+diff --git a/src/handle_action.cpp b/src/handle_action.cpp
+index deff389..9080f54 100644
+--- a/src/handle_action.cpp
++++ b/src/handle_action.cpp
+@@ -2464,6 +2464,9 @@ static const std::set<action_id> host_ui_actions = {
+     // Co-op chat: zero-AP, opens a popup and sends a message, never
+     // mutates world state — safe to use while waiting for the client.
+     ACTION_COOP_CHAT,
++    // Peace/combat mode toggle: zero-AP and the whole point is being able to
++    // flip it (e.g. to combat when enemies appear) at any moment.
++    ACTION_COOP_PEACE_TOGGLE,
+     // Debug menu: a developer/tester tool, deliberately reachable even while
+     // locked. It CAN mutate shared state out of lockstep (same hazard as
+     // ACTION_CONSTRUCT), but unlike construction it's not a normal-play action
+@@ -3852,6 +3855,10 @@ bool game::do_regular_action( action_id &act, avatar &player_character,
+             cata_mp::mp_open_chat();
+             break;
+ 
++        case ACTION_COOP_PEACE_TOGGLE:
++            cata_mp::mp_peace_toggle();
++            break;
++
+         case ACTION_COPY_JOIN_ADDRESS:
+             cata_mp::mp_copy_join_address();
+             break;
+diff --git a/src/mp_gamestate.cpp b/src/mp_gamestate.cpp
+index 67e3626..0c8a9ea 100644
+--- a/src/mp_gamestate.cpp
++++ b/src/mp_gamestate.cpp
+@@ -1140,6 +1140,65 @@ static std::string g_last_host_action_label = "\xe2\x80\x94";
+ // activity ticks on the side that owns the player.  Used by the Co-op HUD and
+ // transition-edge messages.
+ static std::string g_partner_activity;
++
++// ---------------------------------------------------------------------------
++// PEACE MODE ("мирний режим").  A shared, host-authoritative toggle either player
++// can flip (ACTION_COOP_PEACE_TOGGLE).  Off = the strict per-turn lockstep this
++// fork has always had ("бойовий режим").  On = the two players may drift apart
++// in time by up to MP_PEACE_WINDOW_AP action points in EITHER direction, so one
++// can browse a locker / sit in a menu while the other keeps walking, looting
++// and opening doors.
++//
++// Model: g_remote_moves (B) is the client's AP balance against the shared clock.
++//   B > 0  : the client is behind (time passed that it has not spent yet)
++//   B < 0  : the client is ahead  (it spent AP for turns that have not happened)
++// In peace mode the client is told it may spend B + WINDOW ("wire moves"), so it
++// can run up to WINDOW ahead; the host stops waiting for the client entirely
++// until B reaches +WINDOW (the client is a full window behind), and only then
++// falls back to the ordinary blocking lockstep wait.  Every action the client
++// makes still costs AP, so neither side gets free actions; they just don't have
++// to take them in alternation.
++//
++// Peace mode is suspended automatically (the pair falls back to plain lockstep
++// for that stretch) while the client is in a long activity (craft, read, wait,
++// sleep — those tick one grant per turn and must not be fed a banked window),
++// while fast-forward is running, and while the client is driving a vehicle.
++// Switching it either way resets B to 0 so combat always starts in sync.
++static constexpr int MP_PEACE_WINDOW_AP = 5000;
++static bool g_peace_mode = false;
++
++bool mp_peace_mode()
++{
++    return g_peace_mode;
++}
++
++// Host only: is the peace window in effect for the client right now?
++static bool mp_peace_active_host()
++{
++    if( !g_peace_mode || !is_hosting() || !remote_player_connected ) {
++        return false;
++    }
++    if( !g_partner_activity.empty() ) {
++        return false;
++    }
++    if( should_fast_forward() ) {
++        return false;
++    }
++    if( const npc *remote = g->critter_by_id<npc>( remote_player_npc_id ) ) {
++        if( remote->controlling_vehicle ) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// Host only: the move budget the client is told it may spend.  Identical to
++// g_remote_moves outside peace mode.
++static int mp_wire_moves()
++{
++    return mp_peace_active_host() ? g_remote_moves + MP_PEACE_WINDOW_AP : g_remote_moves;
++}
++
+ // Defined further down next to should_fast_forward(); forward-declared here so the
+ // activity_start handler can log the verdict alongside the id.
+ static bool is_fast_forwardable_activity( const std::string &id );
+@@ -2043,6 +2102,17 @@ struct mp_hud_t {
+             const int ping_x = W - utf8_width( ps ) - 1;
+             mvwprintz( win, point( ping_x, crow ), pc, "%s", ps.c_str() );
+ 
++            // Shared peace/combat mode marker, left of the ping.
++            const bool peace_hud = mp_peace_mode();
++            const std::string mode_s = peace_hud ? _( "МИР" ) : _( "БІЙ" );
++            int mode_x = ping_x - 1 - utf8_width( mode_s );
++            if( mode_x > x ) {
++                mvwprintz( win, point( mode_x, crow ), peace_hud ? c_light_green : c_light_red,
++                           "%s", mode_s.c_str() );
++            } else {
++                mode_x = ping_x;
++            }
++
+             const int my_kills = is_hosting() ? g_host_kills : g_client_kills;
+             const int partner_kills = is_hosting() ? g_client_kills : g_host_kills;
+             const std::string mk = std::to_string( my_kills );
+@@ -2053,7 +2123,7 @@ struct mp_hud_t {
+             //~ immediately after it in a different color.
+             const std::string kills_label = _( "kills " );
+             const std::string tally = kills_label + mk + "·" + pk;
+-            const int tally_x = ping_x - 2 - utf8_width( tally );
++            const int tally_x = mode_x - 2 - utf8_width( tally );
+             if( tally_x > x ) {   // draw only if it doesn't overrun the left content
+                 // Color the two numbers apart so it's obvious which is which at a
+                 // glance: partner's count in green to match their green '@' proxy
+@@ -2352,6 +2422,108 @@ void mp_open_chat()
+     mp_chat_display( _( "You" ), text, host );   // local echo — own messages show as "You"
+ }
+ 
++// ---------------------------------------------------------------------------
++// PEACE MODE toggle plumbing (state + rules: see MP_PEACE_WINDOW_AP above).
++//
++// Wire, both directions: {"type":"peace_mode","on":<bool>,"by":<name>}
++//  - client -> host: a request; the host applies it and echoes it to the client.
++//  - host -> client: the authoritative new value (also repeated as "peace" in
++//    every state packet, so a missed toggle self-heals on the next turn).
++
++// Set the mode; announce a change in the message log.  On the host this also
++// resyncs the client's balance and tells the client.  `by` is the name of the
++// player who flipped it ("" when only resyncing from a state packet).
++static void mp_peace_apply( bool on, const std::string &by )
++{
++    if( on == g_peace_mode ) {
++        return;
++    }
++    g_peace_mode = on;
++    mp_log( std::string( "[cdda-mp] PEACE-MODE: " ) + ( on ? "on" : "off" ) +
++            ( by.empty() ? std::string() : " by " + by ) );
++    if( is_hosting() ) {
++        // Start each mode in sync: no carried advance or bank either way.
++        g_remote_moves = 0;
++        if( server *srv = get_active_server() ) {
++            srv->post_broadcast( std::string( "{\"type\":\"peace_mode\",\"on\":" ) +
++                                 ( on ? "true" : "false" ) + ",\"by\":\"" +
++                                 json_escape_str( by ) + "\"}\n" );
++        }
++    }
++    const std::string who = by.empty() ? std::string() : " (" + by + ")";
++    if( on ) {
++        //~ %1$s is " (player name)" or empty, %2$d is the AP window.
++        add_msg( m_good, _( "Мирний режим увімкнено%1$s: кожен може діяти до %2$d ОД, не чекаючи партнера." ),
++                 who, MP_PEACE_WINDOW_AP );
++    } else {
++        //~ %s is " (player name)" or empty.
++        add_msg( m_warning, _( "Бойовий режим увімкнено%s: ходи суворо по черзі." ), who );
++    }
++    if( g ) {
++        g->invalidate_main_ui_adaptor();
++    }
++}
++
++// Host or client: an incoming {"type":"peace_mode",...} packet.
++static void mp_handle_peace_msg( const std::string &msg )
++{
++    try {
++        JsonValue jv = json_loader::from_string( msg );
++        JsonObject jo = jv.get_object();
++        jo.allow_omitted_members();
++        const bool on = jo.get_bool( "on", false );
++        const std::string by = jo.get_string( "by", std::string() );
++        mp_peace_apply( on, by );
++    } catch( const JsonError &e ) {
++        mp_log( "[cdda-mp] peace_mode parse error: " + std::string( e.what() ) );
++    }
++}
++
++// Keybound entry point (ACTION_COOP_PEACE_TOGGLE).  Zero AP, allowed while
++// locked, so either player can drop the pair into combat mode at any moment.
++void mp_peace_toggle()
++{
++    const bool partner = is_hosting() ? remote_player_connected : is_client_mode();
++    if( !partner ) {
++        add_msg( m_warning, _( "No co-op partner connected." ) );
++        return;
++    }
++    const bool want = !g_peace_mode;
++    const std::string me = get_avatar().get_name();
++    if( is_hosting() ) {
++        mp_peace_apply( want, me );
++    } else {
++        // The host decides; its echo flips our flag and prints the message.
++        client_send( std::string( "{\"type\":\"peace_mode\",\"on\":" ) +
++                     ( want ? "true" : "false" ) + ",\"by\":\"" + json_escape_str( me ) + "\"}" );
++    }
++}
++
++// Client: in peace mode a grant can carry a whole window of AP.  While the
++// avatar is in an activity, never let more than one turn per represented turn
++// through, or the activity would progress many turns at once.
++static int mp_peace_clamp_moves_for_activity( int moves, int turns )
++{
++    if( !g_peace_mode || !is_client_mode() || moves <= 0 || !get_avatar().activity ) {
++        return moves;
++    }
++    const int cap = std::max( 1, get_avatar().get_speed() ) * std::max( 1, turns );
++    return std::min( moves, cap );
++}
++
++void mp_peace_clamp_local_activity( Character &u )
++{
++    if( !u.is_avatar() || !u.activity ) {
++        return;
++    }
++    const int clamped = mp_peace_clamp_moves_for_activity( u.get_moves(), 1 );
++    if( clamped != u.get_moves() ) {
++        mp_log( "[cdda-mp] PEACE-CLAMP: activity " + u.activity.id().str() + " moves " +
++                std::to_string( u.get_moves() ) + "->" + std::to_string( clamped ) );
++        u.set_moves( clamped );
++    }
++}
++
+ // Shared clipboard-copy body for the join address — used by both the manual
+ // copy_join_address keybind (mp_copy_join_address(), guarded below) and the
+ // hide-IP auto-copy at host-arm time (mp_menu_start_host_session()). The two
+@@ -5946,11 +6118,28 @@ peer_modal_hold::~peer_modal_hold()
+ static void srv_emit_ack( const char *action_name )
+ {
+     g_client_acted_this_turn = true;
+-    g_remote_moves = 0;
+-    mp_log( std::string( "[cdda-mp] SRV-ACK: moves=0 (" ) + action_name
+-            + ") grant_seq=" + std::to_string( g_grant_seq ) );
++    // PEACE MODE: the action costs one turn of the client's speed out of its
++    // balance instead of ending its turn; while the window still has room the
++    // reply is a partial-turn update (free=true) so the client keeps acting.
++    const bool peace = mp_peace_active_host();
++    if( peace ) {
++        const npc *remote = g->critter_by_id<npc>( remote_player_npc_id );
++        const int cost = remote ? mp_client_grant_speed( *remote ) : 100;
++        g_remote_moves = std::min( g_remote_moves, MP_PEACE_WINDOW_AP ) - cost;
++    } else {
++        g_remote_moves = 0;
++    }
++    const bool peace_keep_turn = peace && mp_wire_moves() > 0;
++    mp_log( std::string( "[cdda-mp] SRV-ACK: moves=" ) + std::to_string( g_remote_moves ) +
++            " (" + action_name + ")" + ( peace ? " peace" : "" ) +
++            ( peace_keep_turn ? " keep-turn" : "" ) +
++            " grant_seq=" + std::to_string( g_grant_seq ) );
+     server *srv = get_active_server();
+-    if( srv ) {
++    if( srv && peace_keep_turn ) {
++        std::string state = serialize_remote_player_state( false );
++        state = state.substr( 0, state.size() - 1 ) + ",\"free\":true}";
++        srv->post_broadcast( state + "\n" );
++    } else if( srv ) {
+         // MP PERF 2026-08-15 — the "wait" ack is the ONLY caller here that mutates
+         // no world state (see the is_wait branch in handle_remote_action: it logs
+         // and acks, nothing else). It is also the overwhelming majority during a
+@@ -6588,6 +6777,11 @@ static void handle_remote_action( const std::string &/*name*/, const std::string
+         return;
+     }
+ 
++    if( msg.find( "\"type\":\"peace_mode\"" ) != std::string::npos ) {
++        mp_handle_peace_msg( msg );
++        return;
++    }
++
+     if( msg.find( "\"type\":\"high_five\"" ) != std::string::npos ) {
+         mp_handle_high_five_recv( msg );
+         return;
+@@ -8959,6 +9153,9 @@ static void handle_remote_action( const std::string &/*name*/, const std::string
+     bool acted = false;
+     // A plain walk/run step onto the next tile (not melee, door, or drag).
+     bool stepped = false;
++    // PEACE MODE: an action below whose AP the SRV-ACK used to settle by zeroing
++    // the budget (bump-open door) and so never charged it explicitly.
++    bool uncharged_act = false;
+ 
+     // Move or attack, matching single-player bump-to-attack behavior.
+     // Check for a creature first — melee_attack applies regardless of tile passability.
+@@ -9227,6 +9424,7 @@ static void handle_remote_action( const std::string &/*name*/, const std::string
+             // move budget when acted=true.
+             if( m.open_door( *remote, next, true, false ) ) {
+                 acted = true;
++                uncharged_act = true;
+             }
+             // else: solid wall — acted stays false, no AP charged
+         }
+@@ -9246,7 +9444,17 @@ static void handle_remote_action( const std::string &/*name*/, const std::string
+     // turn's next action.  The leftover never outlives the turn — the client
+     // spends it on another step (going into debt) or ends the turn with a wait.
+     // Melee, doors and drag still end the turn (not yet measured).
+-    const bool partial_step = stepped && g_remote_moves > 0;
++    // PEACE MODE: a step already charged its real cost above; a bump action
++    // (melee, bump-open door) that has no explicit charge costs one turn.  Either
++    // way the client keeps acting while the peace window has room.
++    const bool peace = mp_peace_active_host();
++    if( peace && uncharged_act ) {
++        g_remote_moves -= mp_client_grant_speed( *remote );
++    }
++    const bool partial_step = ( stepped || ( peace && acted ) ) && mp_wire_moves() > 0;
++    if( partial_step && peace ) {
++        g_client_acted_this_turn = true;
++    }
+     if( partial_step ) {
+         mp_log( "[cdda-mp] SRV-PARTIAL: step left moves=" + std::to_string( g_remote_moves ) +
+                 ", client keeps the turn, grant_seq=" + std::to_string( g_grant_seq ) );
+@@ -9998,12 +10206,18 @@ void grant_client_turn()
+     // packet will actually represent. Outside FF that is 1 and the behavior is
+     // identical to before.
+     const bool ff_now_for_cap = should_fast_forward();
+-    const int ap_cap = grant_speed * ( ff_now_for_cap ? FF_BATCH_TURNS : 1 );
++    // PEACE MODE: the client may bank up to a full window of unspent turns (the
++    // host stops waiting for it until it is that far behind, see
++    // wait_for_client_action), and is told it may spend that bank plus a window
++    // of advance (mp_wire_moves).
++    const bool peace_now = mp_peace_active_host();
++    const int ap_cap = peace_now ? MP_PEACE_WINDOW_AP
++                       : grant_speed * ( ff_now_for_cap ? FF_BATCH_TURNS : 1 );
+     if( g_remote_moves > ap_cap ) {
+         g_pace_win.cli_capped += g_remote_moves - ap_cap;
+         g_remote_moves = ap_cap;
+     }
+-    g_granted_this_turn = ( g_remote_moves > 0 );
++    g_granted_this_turn = ( mp_wire_moves() > 0 );
+     if( g_granted_this_turn ) {
+         ++g_grant_seq;
+     } else {
+@@ -10410,6 +10624,16 @@ void wait_for_client_action()
+         return;
+     }
+ 
++    // PEACE MODE: don't wait for the client while it is less than a full window
++    // behind.  Pump its queued actions and let the host's turn proceed.  Once the
++    // client's unspent balance reaches the window, fall through to the ordinary
++    // blocking wait below (the loop re-checks and releases as soon as the client
++    // spends some of it).
++    if( mp_peace_active_host() && g_remote_moves < MP_PEACE_WINDOW_AP ) {
++        process_mp_events();
++        return;
++    }
++
+     // No partner-activity bypass: every activity (drop, wear, take_off, read,
+     // craft, eat, wait, …) now dispatches a "wait" ack per tick via the
+     // do_turn post-loop dispatch path, so strict lockstep works for them all.
+@@ -10474,6 +10698,11 @@ void wait_for_client_action()
+         if( g_client_acted_this_turn ) {
+             break;  // client acted, advance shared clock by this turn
+         }
++        // PEACE MODE: the window is open again (the client spent some of its
++        // bank, or peace was just switched on) — stop waiting.
++        if( mp_peace_active_host() && g_remote_moves < MP_PEACE_WINDOW_AP ) {
++            break;
++        }
+         // Mid-wait FF check: client's activity_start may arrive *after* we
+         // entered the wait (host entered first), so the entry-time
+         // should_fast_forward() returned false.  Re-check each iter — the
+@@ -13316,6 +13545,7 @@ void process_mp_events()
+                || data.find( "\"type\":\"trade_delta\"" ) != std::string::npos
+                || data.find( "\"type\":\"note_sync\"" ) != std::string::npos
+                || data.find( "\"type\":\"chat\"" ) != std::string::npos
++               || data.find( "\"type\":\"peace_mode\"" ) != std::string::npos
+                || data.find( "\"type\":\"templates_list\"" ) != std::string::npos
+                || data.find( "\"type\":\"resync_request\"" ) != std::string::npos
+                || data.find( "\"type\":\"heartbeat\"" ) != std::string::npos
+@@ -14337,6 +14567,11 @@ static bool apply_one_state_message( const std::string &msg )
+         return true;
+     }
+ 
++    if( msg.find( "\"type\":\"peace_mode\"" ) != std::string::npos ) {
++        mp_handle_peace_msg( msg );
++        return true;
++    }
++
+     // Partner cast a support spell at us.  Symmetric with the host-side handler
+     // in handle_remote_action.  Body in mp_magic.cpp.
+     if( msg.find( "\"type\":\"partner_spell\"" ) != std::string::npos ) {
+@@ -15569,8 +15804,16 @@ static bool apply_one_state_message( const std::string &msg )
+                 g_client_waiting_for_ack = false;
+             }
+         }
++        // PEACE MODE: follow the host's shared toggle (authoritative).
++        if( jo.has_bool( "peace" ) ) {
++            mp_peace_apply( jo.get_bool( "peace" ), std::string() );
++        }
+         if( jo.has_member( "moves" ) ) {
+-            const int srv_moves = jo.get_int( "moves" );
++            // In peace mode the host may hand over a whole window of AP; an
++            // activity must still only ever get one turn's worth per grant.
++            const int srv_moves = mp_peace_clamp_moves_for_activity(
++                                      jo.get_int( "moves" ),
++                                      jo.has_int( "batch_turns" ) ? jo.get_int( "batch_turns" ) : 1 );
+             // Refresh the "last heard from host" timestamp on any moves-bearing
+             // state message (grants AND ack-clears).
+             g_last_grant_time = std::chrono::steady_clock::now();
+@@ -21708,7 +21951,10 @@ std::string serialize_remote_player_state( bool skip_tile_scan )
+            // FF_BATCH_TURNS for a batched fast-forward grant, telling the client to
+            // tick its activity that many times rather than once.
+            ",\"batch_turns\":" + std::to_string( g_batch_turns_to_send ) +
+-           ",\"moves\":" + std::to_string( g_remote_moves ) +
++           ",\"moves\":" + std::to_string( mp_wire_moves() ) +
++           // PEACE MODE flag, so the client always knows the shared mode even if
++           // it missed the toggle packet (join, reconnect).
++           ",\"peace\":" + ( g_peace_mode ? "true" : "false" ) +
+            ",\"speed\":" + std::to_string( remote->get_speed() ) +
+            ",\"client_move_mode\":\"" + remote->move_mode.str() + "\""
+            ",\"client_stamina\":" + std::to_string( remote->get_stamina() ) +
+diff --git a/src/mp_gamestate.h b/src/mp_gamestate.h
+index 4630ebb..faf12ce 100644
+--- a/src/mp_gamestate.h
++++ b/src/mp_gamestate.h
+@@ -1272,6 +1272,17 @@ void mp_relay_shout( int vol, bool order );
+ // to the partner and echoes it locally; shown above the info panel + message log.
+ void mp_open_chat();
+ 
++// MP peace mode ("мирний режим"): shared host-authoritative toggle.  Off =
++// strict per-turn lockstep (combat).  On = each player may act up to a window
++// of action points ahead of / behind the other without waiting.  See
++// MP_PEACE_WINDOW_AP in mp_gamestate.cpp.
++bool mp_peace_mode();
++// ACTION_COOP_PEACE_TOGGLE: flip the shared mode (either player, zero AP).
++void mp_peace_toggle();
++// Client: while in an activity, clamp a banked peace-mode budget to one turn
++// so the activity can't consume many turns at once.  No-op on the host/SP.
++void mp_peace_clamp_local_activity( Character &u );
++
+ // MP: copy the host's join address to the clipboard (ACTION_COPY_JOIN_ADDRESS).
+ // Streaming-privacy companion to the hide-IP option prompted at host-arm time —
+ // the address is never drawn on screen when hide-IP is on; this is how the host
