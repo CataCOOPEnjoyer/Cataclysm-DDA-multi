@@ -177,6 +177,14 @@ jobs:
         with:
           name: translations
 
+      - name: Apply peace-mode patch (co-op peace/combat toggle)
+        shell: bash
+        run: |
+          git -c core.autocrlf=false show HEAD:peace-mode.patch > /tmp/peace.patch
+          git apply --cached /tmp/peace.patch
+          git checkout -- src data
+          git diff --cached --stat
+
       - uses: ./.github/actions/build-windows
         with:
           version: ${{ needs.setup.outputs.version }}
