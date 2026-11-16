@@ -1,0 +1,66 @@
+diff --git a/src/handle_action.cpp b/src/handle_action.cpp
+index 9080f54..960ac0c 100644
+--- a/src/handle_action.cpp
++++ b/src/handle_action.cpp
+@@ -514,6 +514,13 @@ input_context game::get_player_input( std::string &action )
+                   cata_mp::partner_in_interactive_activity() ) ) {
+                 break;
+             }
++            // MP peace mode: the client is ahead of the shared clock and the
++            // host is idle here -> return TIMEOUT so the host auto-pauses one
++            // turn and world time catches up with the client.
++            if( cata_mp::is_hosting() && action == "TIMEOUT" &&
++                cata_mp::mp_peace_host_should_autowait() ) {
++                break;
++            }
+         } while( handle_mouseview( ctxt, action ) && uquit != QUIT_WATCH
+                  && ( action != "TIMEOUT" || !current_turn.has_timeout_elapsed() ) );
+         ctxt.reset_timeout();
+@@ -539,6 +546,10 @@ input_context game::get_player_input( std::string &action )
+                         cata_mp::client_acted_this_turn() ) {
+                         break;
+                     }
++                    // Same peace-mode catch-up as the animation-loop branch.
++                    if( cata_mp::mp_peace_host_should_autowait() ) {
++                        break;
++                    }
+                 }
+                 if( cata_mp::is_client_mode() ) {
+                     cata_mp::client_process_incoming();
+diff --git a/src/mp_gamestate.cpp b/src/mp_gamestate.cpp
+index 0c8a9ea..c79ee9b 100644
+--- a/src/mp_gamestate.cpp
++++ b/src/mp_gamestate.cpp
+@@ -1199,6 +1199,18 @@ static int mp_wire_moves()
+     return mp_peace_active_host() ? g_remote_moves + MP_PEACE_WINDOW_AP : g_remote_moves;
+ }
+ 
++// Host only: in peace mode the client has run ahead of the shared clock
++// (spent AP for turns that have not happened yet).  When the host is idle at
++// the main map, its input loop uses this to let the turn pass on its own
++// (the ordinary TIMEOUT auto-pause, which safe mode still blocks when hostiles
++// are in view), so world time keeps up with the client instead of freezing
++// until the host presses a key.  A host sitting in a menu doesn't reach that
++// loop, so the client can still run ahead by up to the window there.
++bool mp_peace_host_should_autowait()
++{
++    return mp_peace_active_host() && g_remote_moves < 0;
++}
++
+ // Defined further down next to should_fast_forward(); forward-declared here so the
+ // activity_start handler can log the verdict alongside the id.
+ static bool is_fast_forwardable_activity( const std::string &id );
+diff --git a/src/mp_gamestate.h b/src/mp_gamestate.h
+index faf12ce..c1bf5e2 100644
+--- a/src/mp_gamestate.h
++++ b/src/mp_gamestate.h
+@@ -1277,6 +1277,9 @@ void mp_open_chat();
+ // of action points ahead of / behind the other without waiting.  See
+ // MP_PEACE_WINDOW_AP in mp_gamestate.cpp.
+ bool mp_peace_mode();
++// Host: peace mode and the client is ahead of the shared clock -> an idle host
++// should let its turn pass (TIMEOUT auto-pause) so world time keeps up.
++bool mp_peace_host_should_autowait();
+ // ACTION_COOP_PEACE_TOGGLE: flip the shared mode (either player, zero AP).
+ void mp_peace_toggle();
+ // Client: while in an activity, clamp a banked peace-mode budget to one turn
