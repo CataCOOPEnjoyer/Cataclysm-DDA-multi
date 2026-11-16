@@ -191,6 +191,10 @@ jobs:
           grep -q 'DYNLINK-MARKER' Makefile || { echo 'static-link line not found'; exit 1; }
           sed -i 's/ -DYNLINK-MARKER//' Makefile
           grep -n -E '^    LDFLAGS \+=\r?$' Makefile
+          # snmalloc overrides operator new/delete in the exe only; with a dynamic
+          # libstdc++-6.dll that mixes allocators -> heap corruption (0xC0000374).
+          sed -i -E 's/^#define CATA_USE_SNMALLOC(\r?)$/\/\/ CATA_USE_SNMALLOC disabled: dynamic libstdc++ build\1/' src/cata_allocator.cpp
+          grep -q 'CATA_USE_SNMALLOC disabled' src/cata_allocator.cpp || { echo 'snmalloc define not found'; exit 1; }
 
       - uses: ./.github/actions/build-windows
         with:
