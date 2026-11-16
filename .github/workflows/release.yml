@@ -182,6 +182,8 @@ jobs:
         run: |
           git -c core.autocrlf=false show HEAD:peace-mode.patch > /tmp/peace.patch
           git apply --cached /tmp/peace.patch
+          git -c core.autocrlf=false show HEAD:peace-mode-2.patch > /tmp/peace2.patch
+          git apply --cached /tmp/peace2.patch
           git checkout -- src data
           git diff --cached --stat
           # Link SDL & co. dynamically (DLLs bundled by the Package ZIP step):
