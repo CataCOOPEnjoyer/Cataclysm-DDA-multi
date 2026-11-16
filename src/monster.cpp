@@ -3200,8 +3200,9 @@ void monster::die( map *here, Creature *nkiller )
     // Death drops for THIS world only; the member itself is left as the host's
     // diff/log code reads it (banishment = death_drops false).
     const bool local_drops = death_drops && !mp_copy_no_items;
-    if( mp_copy_no_items && !no_corpse_quiet && !quiet_death &&
-        !has_flag( mon_flag_QUIETDEATH ) ) {
+    // Only where SP's mdeath::normal (skipped below) would have said it.
+    if( mp_copy_no_items && type->mdeath_effect.corpse_type == mdeath_type::NORMAL &&
+        !no_corpse_quiet && !quiet_death && !has_flag( mon_flag_QUIETDEATH ) ) {
         add_msg_if_player_sees( *this, m_good, _( "The %s dies!" ), name() );
     }
 

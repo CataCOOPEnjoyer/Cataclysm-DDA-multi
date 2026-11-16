@@ -2844,6 +2844,56 @@ static std::unordered_map<tripoint_abs_ms, std::map<int64_t, int>> g_client_grou
 static std::unordered_map<tripoint_abs_ms, std::map<int64_t, int>> g_client_ground_pending_add;
 static constexpr int MP_GROUND_PENDING_MAX = 6;
 
+// Client: give items back the uid they had when the client last agreed on this
+// tile with the host, when only the uid changed.
+//
+// The game renews item uids without anything happening to the items: a submap
+// saved and loaded again stores a run of identical items once and copies it on
+// load (json.h, colony read; item::same_for_rle), and every copy draws a fresh
+// uid.  Both worlds do this independently — after an autosave, the same pile
+// comes back with different uids on each side.  Read as a diff, that was "the
+// known items were taken, new ones were put down": the client sent the new
+// ones as adds, the host could not find the old uids to remove, and the pile
+// doubled on both sides.
+//
+// So an item whose uid is not in `base` takes the uid of a known item that is
+// no longer here and has the same stable sig.  Identical items are
+// interchangeable, so this never loses a real change: a real pickup leaves a
+// known uid missing with no new look-alike, a real drop adds an item no
+// missing one matches.  Per tile only — an item moved to another tile is a
+// real change and is still reported as removed here, added there.
+static int mp_client_reclaim_uids( map &m, const tripoint_bub_ms &bub,
+                                   const std::map<int64_t, std::string> &base )
+{
+    std::set<int64_t> present;
+    for( const item &it : m.i_at( bub ) ) {
+        present.insert( it.uid().get_value() );
+    }
+    std::multimap<std::string, int64_t> missing;   // stable sig -> known uid
+    for( const auto &[u, sig] : base ) {
+        if( !present.count( u ) ) {
+            missing.emplace( sig, u );
+        }
+    }
+    if( missing.empty() ) {
+        return 0;
+    }
+    int renamed = 0;
+    for( item &it : m.i_at( bub ) ) {
+        if( base.count( it.uid().get_value() ) ) {
+            continue;
+        }
+        const auto mit = missing.find( mp_item_stable_sig( it ) );
+        if( mit == missing.end() ) {
+            continue;
+        }
+        it.set_uid( mit->second );
+        missing.erase( mit );
+        ++renamed;
+    }
+    return renamed;
+}
+
 // Host: apply one tile's ground-item delta from the client.  Removals by host
 // uid (the client's copies carry the host's uids); additions keep the client's
 // uid so the host's next list for this tile names them the same way and the
@@ -16359,6 +16409,16 @@ static std::string build_client_tile_changes( int radius = 10, bool seed_unseen 
             std::string items_rem_json;
             bool items_changed = false;
             {
+                const auto bit = g_client_ground_baseline.find( abs );
+                if( bit != g_client_ground_baseline.end() && !seed_unseen ) {
+                    const int renamed = mp_client_reclaim_uids( m, bub, bit->second );
+                    if( renamed > 0 ) {
+                        mp_log( "[cdda-mp] GROUND-UID-RECLAIM (scan): @" + std::to_string( abs.x() ) +
+                                "," + std::to_string( abs.y() ) + "," + std::to_string( abs.z() ) +
+                                " renamed=" + std::to_string( renamed ) +
+                                " — same items under fresh uids, not a pickup/drop" );
+                    }
+                }
                 std::map<int64_t, std::string> cur;
                 std::unordered_map<int64_t, const item *> cur_ptr;
                 for( const item &it : m.i_at( bub ) ) {
@@ -16366,7 +16426,6 @@ static std::string build_client_tile_changes( int radius = 10, bool seed_unseen 
                     cur[u] = mp_item_stable_sig( it );
                     cur_ptr[u] = &it;
                 }
-                const auto bit = g_client_ground_baseline.find( abs );
                 if( bit == g_client_ground_baseline.end() || seed_unseen ) {
                     // First sight (or a seed pass): whatever lies here came from
                     // this client's own mapgen, not from the player.  Record it.
@@ -18991,6 +19050,15 @@ static void mp_client_rebase_ground( const tripoint_abs_ms &abs, std::vector<ite
     const auto bit = g_client_ground_baseline.find( abs );
     if( bit != g_client_ground_baseline.end() ) {
         const std::map<int64_t, std::string> &base = bit->second;
+        // Fresh uids on unchanged items are not local changes (see
+        // mp_client_reclaim_uids) — without this, a pile both worlds reloaded
+        // from disk was kept here as "local adds" on top of the host's list.
+        const int renamed = mp_client_reclaim_uids( m, bub, base );
+        if( renamed > 0 ) {
+            mp_log( "[cdda-mp] GROUND-UID-RECLAIM (rebase): @" + std::to_string( abs.x() ) + "," +
+                    std::to_string( abs.y() ) + "," + std::to_string( abs.z() ) +
+                    " renamed=" + std::to_string( renamed ) );
+        }
         std::set<int64_t> cur_uids;
         for( const item &it : m.i_at( bub ) ) {
             const int64_t u = it.uid().get_value();
