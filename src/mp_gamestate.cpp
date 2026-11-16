@@ -2773,7 +2773,145 @@ static void mp_apply_partial_con_obj( const tripoint_bub_ms &bub, JsonObject po 
 // the host's own state ping-pongs back as ~80 KB per turn.  apply_tile_changes
 // refreshes these baselines from server-pushed state so the next outgoing
 // build_client_tile_changes recognizes the tile as unchanged and skips it.
-static std::unordered_map<tripoint_abs_ms, std::string> g_client_item_baseline;
+// ---------------------------------------------------------------------------
+// GROUND-ITEM SYNC (2026-11-16): deltas by item uid, not whole-tile replace.
+//
+// Both directions used to ship a tile's COMPLETE item list whenever its
+// fingerprint changed, and the receiver did i_clear() + re-add.  With two
+// worlds simulating at once that is last-writer-wins with no ordering, and it
+// duplicated items: a list built before the peer's pickup arrived after it and
+// put the picked-up item back on the ground; a deferred replace (menu open)
+// applied a stale list later; and the fingerprint was a full serialize(), so
+// temperature/rot ticking on an untouched tile re-sent it and re-ran the
+// replace.  Now, mirroring the vehicle-cargo protocol that already fixed the
+// same dupe class there:
+//   * host -> client still sends the host's full list (the host is the
+//     authority), and the client keeps the HOST's uids on its copies;
+//   * client -> host sends only what the client did: "items_add" (full json)
+//     and "items_rem" (host uids), diffed against what it last agreed with the
+//     host (g_client_ground_baseline);
+//   * the client applies a host list by REBASING its own not-yet-reported
+//     changes on top of it, so neither side's change can be undone by the
+//     other's stale snapshot.
+// Fingerprints use mp_item_stable_sig(), which leaves out temperature, rot and
+// other state each world advances on its own.
+
+// What a peer needs to notice about one item: identity, amount, damage and
+// everything nested inside it.  NOT serialize() — see above.
+static std::string mp_item_stable_sig( const item &it )
+{
+    std::string s = it.typeId().str();
+    s += ':';
+    s += std::to_string( it.count() );
+    s += ':';
+    s += std::to_string( it.damage() );
+    for( const item *c : it.all_items_ptr() ) {
+        s += '|';
+        s += c->typeId().str();
+        s += ':';
+        s += std::to_string( c->count() );
+    }
+    return s;
+}
+
+// Host fingerprint for a tile's items: uid + stable sig per item.  The uid is
+// part of it so a tile whose items were re-created (new uids) is re-sent and
+// the client keeps matching uids.
+static std::string mp_ground_items_sig( map &m, const tripoint_bub_ms &bub )
+{
+    std::string sig;
+    for( const item &it : m.i_at( bub ) ) {
+        sig += std::to_string( it.uid().get_value() );
+        sig += '=';
+        sig += mp_item_stable_sig( it );
+        sig += ',';
+    }
+    return sig;
+}
+
+// Client: per tile, uid -> stable sig of the items it last agreed on with the
+// host (host uids after a host list was applied).  No entry = the client has
+// never seen this tile settled; its first scan only records it (the items there
+// came from the client's own mapgen, not from anything the player did).
+static std::unordered_map<tripoint_abs_ms, std::map<int64_t, std::string>>
+        g_client_ground_baseline;
+// Client: uids it reported removed (or added) that the host's lists have not
+// confirmed yet, with the number of host lists seen since.  A host list that is
+// older than the report must not undo it (pending removal: keep it off the
+// tile; pending add: keep it on).  Expires after MP_GROUND_PENDING_MAX host
+// lists, so a change the host refused converges back to the host.
+static std::unordered_map<tripoint_abs_ms, std::map<int64_t, int>> g_client_ground_pending_rem;
+static std::unordered_map<tripoint_abs_ms, std::map<int64_t, int>> g_client_ground_pending_add;
+static constexpr int MP_GROUND_PENDING_MAX = 6;
+
+// Host: apply one tile's ground-item delta from the client.  Removals by host
+// uid (the client's copies carry the host's uids); additions keep the client's
+// uid so the host's next list for this tile names them the same way and the
+// client can confirm its pending add.  An added uid already on the tile is a
+// re-echo of something the host has, never a new item, and is refused.
+//
+// The tile's items baseline is deliberately NOT refreshed here: the next scan
+// sends the host's resulting list back, which the client rebases to a no-op
+// when it already matches, and which corrects it when the host refused part of
+// the delta or had its own unsent change on the same tile.
+static void mp_host_apply_ground_delta( const tripoint_abs_ms &abs,
+                                        const std::vector<int64_t> &rem_uids,
+                                        std::vector<item> &add_items )
+{
+    map &m = get_map();
+    const std::string at = std::to_string( abs.x() ) + "," + std::to_string( abs.y() ) + "," +
+                           std::to_string( abs.z() );
+    if( !m.inbounds( abs ) ) {
+        mp_log( "[cdda-mp] GROUND-DELTA (host): @" + at + " out of bounds by apply time, dropped" );
+        return;
+    }
+    const tripoint_bub_ms bub = m.get_bub( abs );
+    std::string rem_log;
+    std::string miss_log;
+    std::string add_log;
+    std::string dupe_log;
+    for( const int64_t u : rem_uids ) {
+        bool found = false;
+        map_stack stack = m.i_at( bub );
+        for( auto it = stack.begin(); it != stack.end(); ++it ) {
+            if( it->uid().get_value() == u ) {
+                rem_log += it->typeId().str() + ",";
+                m.i_rem( bub, &*it );
+                found = true;
+                break;
+            }
+        }
+        if( !found ) {
+            // Already gone host-side (the host took it too, or never had it).
+            miss_log += std::to_string( u ) + ",";
+        }
+    }
+    std::unordered_set<int64_t> present;
+    for( const item &it : m.i_at( bub ) ) {
+        present.insert( it.uid().get_value() );
+    }
+    for( item &it : add_items ) {
+        const int64_t u = it.uid().get_value();
+        const std::string tname = it.typeId().str();
+        if( u != 0 && present.count( u ) ) {
+            dupe_log += tname + ",";
+            continue;
+        }
+        item &placed = m.add_item( bub, std::move( it ) );
+        if( placed.is_null() ) {
+            miss_log += "unplaceable:" + tname + ",";
+            continue;
+        }
+        if( u > 0 ) {
+            placed.set_uid( u );   // add_item's internal copy drew a fresh uid
+        }
+        present.insert( u );
+        add_log += tname + ",";
+    }
+    mp_log( "[cdda-mp] GROUND-DELTA (host): @" + at + " added=" + add_log + " removed=" + rem_log +
+            " missing=" + miss_log + " dupe_rejected=" + dupe_log );
+}
+
 static std::unordered_map<tripoint_abs_ms, std::string> g_client_terfurn_baseline;
 static std::unordered_map<tripoint_abs_ms, std::string> g_client_trap_baseline;
 static std::unordered_map<tripoint_abs_ms, std::string> g_client_graffiti_baseline;
@@ -7675,84 +7813,11 @@ static void handle_remote_action( const std::string &/*name*/, const std::string
                             touched = true;
                         }
                     }
-                    if( to.has_array( "items" ) ) {
-                        // Ground-item apply = i_clear()+rebuild (REPLACE): the host
-                        // tile becomes exactly the client's reported set.  The
-                        // 2026-07-11 UID-diff (c8cd48032e) was a preventive
-                        // conversion that broke this path: item_uid regenerates on
-                        // add_item's internal copy, so the dedup could never match
-                        // (incoming_present=0, proven by ITEMDUP logs) → it only
-                        // ever ADDED → tiles ballooned to 5000+ items → client
-                        // main-thread stalls applying them → HOST-STALL disconnects
-                        // (issue #17/#18, the "duped by the hundreds" + "connection
-                        // unstable during busy activity").  Replace can't accumulate.
-                        // (The dangling-item_location risk the UID-diff guarded is no
-                        // longer rare — see mp_ui_item_ref_guard in mp_gamestate.h: if
-                        // the host's own pickup/examine/AIM UI is open on this exact
-                        // tile, the replace below is deferred until that UI closes.)
-                        std::vector<item> new_items;
-                        for( const JsonValue &iv : to.get_array( "items" ) ) {
-                            try {
-                                item new_item;
-                                JsonObject io = iv.get_object();
-                                io.allow_omitted_members();
-                                new_item.deserialize( io );
-                                if( !new_item.typeId().is_empty() && new_item.typeId().is_valid() ) {
-                                    // DIAGNOSTIC (2026-10-24): the reverse of the host-grenade
-                                    // case — a client's live item arriving in the host's world.
-                                    if( new_item.active && new_item.countdown_point != calendar::turn_max ) {
-                                        mp_log( "[cdda-mp] SYNC-LIVE-ITEM: side=host from_client " +
-                                                new_item.typeId().str() + " @ " + std::to_string( abs.x() ) +
-                                                "," + std::to_string( abs.y() ) + "," + std::to_string( abs.z() ) +
-                                                " countdown_in=" +
-                                                std::to_string( to_turns<int>( new_item.countdown_point - calendar::turn ) ) + "t" );
-                                    }
-                                    new_items.push_back( std::move( new_item ) );
-                                }
-                            } catch( const JsonError & ) {}
-                        }
-                        {
-                            // Compare by type multiset: uids regenerate on add, so
-                            // only "different things on the tile" is meaningful.
-                            std::vector<std::string> host_types;
-                            std::vector<std::string> client_types;
-                            for( const item &it : m.i_at( bub ) ) {
-                                host_types.push_back( it.typeId().str() );
-                            }
-                            for( const item &it : new_items ) {
-                                client_types.push_back( it.typeId().str() );
-                            }
-                            std::sort( host_types.begin(), host_types.end() );
-                            std::sort( client_types.begin(), client_types.end() );
-                            if( host_types != client_types ) {
-                                ++diff_items;
-                                // Name the types, capped: "1->1" alone couldn't say
-                                // which item a REPLACE erased (the 2026-10-14
-                                // passed-pistol loss on the host's own tile).
-                                const auto list = []( const std::vector<std::string> &v ) {
-                                    std::string s;
-                                    for( size_t i = 0; i < v.size() && i < 4; ++i ) {
-                                        s += ( i ? "," : "" ) + v[i];
-                                    }
-                                    return "[" + s + ( v.size() > 4 ? ",…" : "" ) + "]";
-                                };
-                                note_diff( abs, "items " + list( host_types ) + "->" + list( client_types ) );
-                            }
-                        }
-                        auto do_replace = [bub, items = std::move( new_items )]() mutable {
-                            map &m2 = get_map();
-                            m2.i_clear( bub );
-                            for( item &it : items ) {
-                                m2.add_item( bub, std::move( it ) );
-                            }
-                        };
-                        if( mp_ui_holds_item_refs() ) {
-                            mp_defer_item_apply( std::move( do_replace ) );
-                        } else {
-                            do_replace();
-                        }
-                        touched = true;
-                    }
+                    // Ground items: handled after the baseline refresh below
+                    // (see the GROUND-DELTA block there).  The old whole-list
+                    // REPLACE ("items") is gone: it could put back an item the
+                    // host had just picked up, from a client list built before
+                    // that pickup reached it.
                     if( to.has_array( "fields" ) ) {
                         for( const JsonValue &fv : to.get_array( "fields" ) ) {
                             JsonObject fo = fv.get_object();
@@ -7814,7 +7879,60 @@ static void handle_remote_action( const std::string &/*name*/, const std::string
                     // visible tile) to ping-pong ~80 KB of items+fields per
                     // turn, blocking the host's input pump.
                     if( touched ) {
-                        g_tile_baseline[abs] = compute_tile_state( abs );
+                        // Keep the items part: ground items are not echo-suppressed
+                        // any more (see mp_host_apply_ground_delta), and a host-side
+                        // item change on this tile that has not gone out yet must
+                        // not be marked as sent by a client fields/terrain change.
+                        mp_tile_state &bl = g_tile_baseline[abs];
+                        const std::string items_sent = bl.items_sig;
+                        bl = compute_tile_state( abs );
+                        bl.items_sig = items_sent;
+                    }
+                    // GROUND-DELTA: what the client added to / took from this tile
+                    // (build_client_tile_changes).  Parsed now, applied now unless a
+                    // host UI holds item references, then deferred — a delta stays
+                    // correct when applied late, unlike the old whole-list replace.
+                    if( to.has_array( "items_add" ) || to.has_array( "items_rem" ) ) {
+                        std::vector<int64_t> rem_uids;
+                        if( to.has_array( "items_rem" ) ) {
+                            for( const JsonValue &rv : to.get_array( "items_rem" ) ) {
+                                rem_uids.push_back( std::strtoll( rv.get_string().c_str(), nullptr, 10 ) );
+                            }
+                        }
+                        std::vector<item> add_items;
+                        if( to.has_array( "items_add" ) ) {
+                            for( const JsonValue &iv : to.get_array( "items_add" ) ) {
+                                try {
+                                    item new_item;
+                                    JsonObject io = iv.get_object();
+                                    io.allow_omitted_members();
+                                    new_item.deserialize( io );
+                                    if( !new_item.typeId().is_empty() && new_item.typeId().is_valid() ) {
+                                        // DIAGNOSTIC (2026-10-24): the reverse of the host-grenade
+                                        // case — a client's live item arriving in the host's world.
+                                        if( new_item.active && new_item.countdown_point != calendar::turn_max ) {
+                                            mp_log( "[cdda-mp] SYNC-LIVE-ITEM: side=host from_client " +
+                                                    new_item.typeId().str() + " @ " + std::to_string( abs.x() ) +
+                                                    "," + std::to_string( abs.y() ) + "," + std::to_string( abs.z() ) +
+                                                    " countdown_in=" +
+                                                    std::to_string( to_turns<int>( new_item.countdown_point - calendar::turn ) ) + "t" );
+                                        }
+                                        add_items.push_back( std::move( new_item ) );
+                                    }
+                                } catch( const JsonError & ) {}
+                            }
+                        }
+                        ++diff_items;
+                        note_diff( abs, "items +" + std::to_string( add_items.size() ) + " -" +
+                                   std::to_string( rem_uids.size() ) );
+                        auto do_delta = [abs, rem_uids, items = std::move( add_items )]() mutable {
+                            mp_host_apply_ground_delta( abs, rem_uids, items );
+                        };
+                        if( mp_ui_holds_item_refs() ) {
+                            mp_defer_item_apply( std::move( do_delta ) );
+                        } else {
+                            do_delta();
+                        }
                     }
                 }
                 // DIAG (2026-08-27): B13 verification, host half.  The packet log
@@ -8147,98 +8265,23 @@ static void handle_remote_action( const std::string &/*name*/, const std::string
         return;
     }
 
-    // Pickup — drain AP and remove the taken items from the server's authoritative tile.
+    // Pickup — drain AP and acknowledge.  The items themselves leave the host's
+    // tile through this same packet's client_tile_changes ("items_rem", by uid),
+    // applied above.  Removing them here AGAIN by type id took a second item of
+    // the same type (pick one of two cans, the host lost both), and it used the
+    // proxy's position rather than the tile the client actually picked from.
     if( msg.find( "\"action\":\"pickup\"" ) != std::string::npos ) {
-        try {
-            JsonValue jv = json_loader::from_string( msg );
-            JsonObject jo = jv.get_object();
-            jo.allow_omitted_members();
-            // Use NPC's server-side position — client coordinates may be out of sync.
-            const tripoint_bub_ms bub_pos = remote->pos_bub();
-            if( jo.has_array( "items" ) ) {
-                std::vector<itype_id> tids;
-                for( const JsonValue &iv : jo.get_array( "items" ) ) {
-                    JsonObject io = iv.get_object();
-                    io.allow_omitted_members();
-                    const itype_id tid( io.get_string( "t", "" ) );
-                    if( tid.is_valid() ) {
-                        tids.push_back( tid );
-                    }
-                }
-                auto do_remove = [bub_pos, tids]() {
-                    map &here = get_map();
-                    for( const itype_id &tid : tids ) {
-                        map_stack stack = here.i_at( bub_pos );
-                        for( auto it = stack.begin(); it != stack.end(); ++it ) {
-                            if( it->typeId() == tid ) {
-                                here.i_rem( bub_pos, &*it );
-                                mp_log( "[cdda-mp] pickup: removed " + tid.str()
-                                        + " from " + std::to_string( bub_pos.x() ) + ","
-                                        + std::to_string( bub_pos.y() ) );
-                                break;
-                            }
-                        }
-                    }
-                };
-                if( mp_ui_holds_item_refs() ) {
-                    mp_defer_item_apply( do_remove );
-                } else {
-                    do_remove();
-                }
-            }
-        } catch( const JsonError &e ) {
-            mp_log( "[cdda-mp] pickup parse error: " + std::string( e.what() ) );
-        }
+        mp_log( "[cdda-mp] pickup: ack only — removal rides client_tile_changes" );
         srv_emit_ack( "pickup" );
         return;
     }
 
-    // Drop — client dropped items locally; add them to the server's authoritative tile.
-    // Always drop at the remote NPC's current server-side position to avoid coordinate
-    // desync between the client's local bubble and the server's bubble.
+    // Drop — no client sends this any more (drops ride client_tile_changes as
+    // "items_add").  It used to ADD the listed items unconditionally on top of
+    // whatever the tile sync had already placed, a ready-made duplicate, so its
+    // items are ignored and it is only acknowledged.
     if( msg.find( "\"action\":\"drop\"" ) != std::string::npos ) {
-        try {
-            JsonValue jv = json_loader::from_string( msg );
-            JsonObject jo = jv.get_object();
-            jo.allow_omitted_members();
-            map &here = get_map();
-            // Use the absolute coordinates sent by the client; fall back to NPC
-            // proxy position only if the client didn't supply them.
-            const tripoint_abs_ms remote_abs = remote->pos_abs();
-            const tripoint_abs_ms abs_pos{
-                jo.get_int( "x", remote_abs.x() ),
-                jo.get_int( "y", remote_abs.y() ),
-                jo.get_int( "z", remote_abs.z() )
-            };
-            const tripoint_bub_ms bub_pos = here.inbounds( abs_pos )
-                                            ? here.get_bub( abs_pos )
-                                            : remote->pos_bub();
-            mp_log( "[cdda-mp] drop recv: abs=(" + std::to_string( abs_pos.x() ) + ","
-                    + std::to_string( abs_pos.y() ) + "," + std::to_string( abs_pos.z() ) + ")"
-                    + " bub=(" + std::to_string( bub_pos.x() ) + "," + std::to_string( bub_pos.y() ) + ")"
-                    + " has_items=" + std::string( jo.has_array( "items" ) ? "yes" : "NO" ) );
-            if( jo.has_array( "items" ) ) {
-                for( const JsonValue &iv : jo.get_array( "items" ) ) {
-                    try {
-                        item dropped;
-                        JsonObject io = iv.get_object();
-                        io.allow_omitted_members();
-                        dropped.deserialize( io );
-                        if( !dropped.typeId().is_empty() && dropped.typeId().is_valid() ) {
-                            mp_log( "[cdda-mp] drop: added " + dropped.typeId().str()
-                                    + " at " + std::to_string( bub_pos.x() ) + ","
-                                    + std::to_string( bub_pos.y() ) );
-                            here.add_item( bub_pos, std::move( dropped ) );
-                            g_tile_baseline.erase( abs_pos );
-                        }
-                    } catch( const JsonError &e ) {
-                        mp_log( "[cdda-mp] drop: item deserialize error: " + std::string( e.what() ) );
-                    }
-                }
-            }
-        } catch( const JsonError &e ) {
-            mp_log( "[cdda-mp] drop parse error: " + std::string( e.what() ) );
-        }
+        mp_log( "[cdda-mp] drop: legacy action, items ignored — drops ride client_tile_changes" );
         srv_emit_ack( "drop" );
         return;
     }
@@ -14504,6 +14547,12 @@ static bool apply_one_state_message( const std::string &msg )
         g_client_act_pos_seq = 0;
         mp_client_hp_seq_reset();
         g_client_hp_max_sig_sent.clear();   // re-send our max HP to this host
+        // The host clears its tile baseline on re-admit and re-sends every tile;
+        // forget what we agreed before, so the resend is applied as a plain
+        // replace rather than rebased on stale "local changes".
+        g_client_ground_baseline.clear();
+        g_client_ground_pending_rem.clear();
+        g_client_ground_pending_add.clear();
         // Force a real re-teleport on the next state packet instead of the
         // "OUT OF BUBBLE, skip" no-chase path in client_teleport_avatar(). If
         // the host moved (or was moved) far enough while we were gone that
@@ -16076,6 +16125,10 @@ void client_process_incoming()
         g_last_host_proxy_pain = -1;
         // A kill held from a previous session names a nid on a different host.
         g_client_harvested_kills.clear();
+        // Ground-item agreement belongs to the previous session's host too.
+        g_client_ground_baseline.clear();
+        g_client_ground_pending_rem.clear();
+        g_client_ground_pending_add.clear();
         // So do held local moves and the positions they're measured from.
         g_client_local_mon_moves.clear();
         g_client_local_host_move.reset();
@@ -16297,34 +16350,71 @@ static std::string build_client_tile_changes( int radius = 10, bool seed_unseen 
                 terfurn_baseline = terfurn_sig;
             }
 
-            // Items — baseline-gated so we only send when the tile changes.
-            // Full item serialize() is used so nested pocket contents are included.
-            std::string items_sig;
-            std::string items_json = "[]";
-            auto items = m.i_at( bub );
-            if( !items.empty() ) {
-                items_json = "[";
-                bool ifirst = true;
-                for( const item &it : items ) {
-                    const std::string item_json = serialize( it );
-                    items_sig += item_json + ',';
-                    if( !ifirst ) {
-                        items_json += ',';
-                    }
-                    ifirst = false;
-                    items_json += item_json;
+            // Items — a DELTA against what this client last agreed with the host
+            // (see GROUND-ITEM SYNC near g_client_ground_baseline): items it put
+            // here (full json) and host uids it took away.  A same-uid item whose
+            // stable sig changed (charges taken from a stack, something put into a
+            // bag on the ground) goes out as remove + re-add, as for cargo.
+            std::string items_add_json;
+            std::string items_rem_json;
+            bool items_changed = false;
+            {
+                std::map<int64_t, std::string> cur;
+                std::unordered_map<int64_t, const item *> cur_ptr;
+                for( const item &it : m.i_at( bub ) ) {
+                    const int64_t u = it.uid().get_value();
+                    cur[u] = mp_item_stable_sig( it );
+                    cur_ptr[u] = &it;
                 }
-                items_json += "]";
-            }
-            auto &item_baseline = g_client_item_baseline[abs];
-            const bool items_changed = ( item_baseline != items_sig );
-            if( items_changed ) {
-                item_baseline = items_sig;
-                if( !items_sig.empty() && !seed_unseen ) {
-                    mp_log( "[cdda-mp] client tile items @ " +
-                            std::to_string( abs.x() ) + "," +
-                            std::to_string( abs.y() ) + "," +
-                            std::to_string( abs.z() ) );
+                const auto bit = g_client_ground_baseline.find( abs );
+                if( bit == g_client_ground_baseline.end() || seed_unseen ) {
+                    // First sight (or a seed pass): whatever lies here came from
+                    // this client's own mapgen, not from the player.  Record it.
+                    g_client_ground_baseline[abs] = std::move( cur );
+                } else {
+                    std::map<int64_t, std::string> &base = bit->second;
+                    std::map<int64_t, int> *pend_rem = nullptr;
+                    std::map<int64_t, int> *pend_add = nullptr;
+                    const auto add_one = [&]( int64_t u ) {
+                        items_add_json += ( items_add_json.empty() ? "" : "," ) + serialize( *cur_ptr[u] );
+                        if( pend_add == nullptr ) {
+                            pend_add = &g_client_ground_pending_add[abs];
+                        }
+                        ( *pend_add )[u] = 0;
+                    };
+                    const auto rem_one = [&]( int64_t u ) {
+                        items_rem_json += std::string( items_rem_json.empty() ? "" : "," ) + "\"" +
+                                          std::to_string( u ) + "\"";   // string: uids are int64
+                        if( pend_rem == nullptr ) {
+                            pend_rem = &g_client_ground_pending_rem[abs];
+                        }
+                        ( *pend_rem )[u] = 0;
+                    };
+                    for( const auto &[u, sig] : cur ) {
+                        const auto b = base.find( u );
+                        if( b == base.end() ) {
+                            add_one( u );
+                        } else if( b->second != sig ) {
+                            rem_one( u );
+                            add_one( u );
+                        }
+                    }
+                    for( const auto &[u, sig] : base ) {
+                        if( !cur.count( u ) ) {
+                            rem_one( u );
+                        }
+                    }
+                    items_changed = !items_add_json.empty() || !items_rem_json.empty();
+                    if( items_changed ) {
+                        base = std::move( cur );
+                        if( !seed_unseen ) {
+                            mp_log( "[cdda-mp] client tile items delta @ " +
+                                    std::to_string( abs.x() ) + "," +
+                                    std::to_string( abs.y() ) + "," +
+                                    std::to_string( abs.z() ) +
+                                    " rem=[" + items_rem_json + "]" );
+                        }
+                    }
                 }
             }
 
@@ -16414,7 +16504,8 @@ static std::string build_client_tile_changes( int radius = 10, bool seed_unseen 
                 out += ",\"ter\":\"" + ter_str + "\",\"furn\":\"" + furn_str + "\"";
             }
             if( items_changed ) {
-                out += ",\"items\":" + items_json;
+                out += ",\"items_add\":[" + items_add_json + "],\"items_rem\":[" +
+                       items_rem_json + "]";
             }
             if( fields_changed ) {
                 out += ",\"fields\":" + fields_json;
@@ -17547,6 +17638,16 @@ bool is_client_waiting_for_ack()
     return g_client_waiting_for_ack;
 }
 
+bool mp_client_skips_death_items( const monster &mon )
+{
+    if( !is_client_mode() || mon.mp_net_id == 0 ) {
+        return false;
+    }
+    mp_log( "[cdda-mp] MON-CLIENT-NO-CORPSE: nid=" + std::to_string( mon.mp_net_id ) + " " +
+            mon.type->id.str() + " — corpse and drops left to the host" );
+    return true;
+}
+
 bool mp_client_skips_corpse_revival()
 {
     if( !is_client_mode() ) {
@@ -18065,9 +18166,7 @@ static mp_tile_state compute_tile_state( const tripoint_abs_ms &abs )
     st.ter  = m.ter( bub ).id().str();
     st.furn = m.furn( bub ).id().str();
 
-    for( const item &it : m.i_at( bub ) ) {
-        st.items_sig += serialize( it ) + ',';
-    }
+    st.items_sig = mp_ground_items_sig( m, bub );
 
     const field &fld = m.field_at( bub );
     if( fld.field_count() > 0 ) {
@@ -18093,7 +18192,15 @@ static mp_tile_state compute_tile_state( const tripoint_abs_ms &abs )
 }
 
 // Server: scan the sync area and emit tile entries whose ter/furn/items changed since last broadcast.
-static std::string build_tile_changes( const tripoint_abs_ms &center, int radius )
+// A tile further than this (Chebyshev, in map squares) from the client's
+// avatar may lie outside the client's loaded map: the client's map is
+// MAPSIZE submaps across with the avatar in the middle one, so the nearest
+// edge is HALF_MAPSIZE submaps away; less a submap of slack for the proxy's
+// position lagging the client's own.
+static constexpr int MP_CLIENT_MAP_REACH = ( HALF_MAPSIZE - 1 ) * SEEX;
+
+static std::string build_tile_changes( const tripoint_abs_ms &center, int radius,
+                                       const tripoint_abs_ms &client_pos )
 {
     // Per-batch delta counters — see the note at the item/field checks below.
     int dbg_delta_items = 0;
@@ -18128,6 +18235,17 @@ static std::string build_tile_changes( const tripoint_abs_ms &center, int radius
         for( int dx = -radius; dx <= radius; ++dx ) {
             const tripoint_abs_ms abs{ center.x() + dx, center.y() + dy, center.z() };
             if( !m.inbounds( abs ) ) {
+                continue;
+            }
+            // 2026-11-16: never record as sent a tile the client cannot apply.
+            // The scan around the HOST's position reaches tiles outside the
+            // client's loaded map; apply_tile_changes() drops those, but the
+            // baseline below was already updated, so the tile was never sent
+            // again and the client kept its own mapgen version of it for good
+            // (its own loot, or a corpse it made itself).  Leave the baseline
+            // untouched so the tile goes out once the client is near.
+            if( std::max( std::abs( abs.x() - client_pos.x() ),
+                          std::abs( abs.y() - client_pos.y() ) ) > MP_CLIENT_MAP_REACH ) {
                 continue;
             }
             // MP PERF 2026-08-15 — serialize_remote_player_state() runs this scan up
@@ -18165,26 +18283,14 @@ static std::string build_tile_changes( const tripoint_abs_ms &center, int radius
             const auto ts_c = tsclk::now();
             ++n_tiles;
 
-            // Build item fingerprint and JSON simultaneously.
-            // Full item serialize() is used so nested pocket contents are included.
-            std::string items_sig;
-            std::string items_json = "[]";
-            auto items = m.i_at( bub );
-            if( !items.empty() ) {
+            // Item fingerprint: uid + stable sig per item (mp_ground_items_sig).
+            // The JSON itself is built only for a tile that is actually sent,
+            // below — serialize() of every item on every scanned tile was most
+            // of the scan cost, and its volatile fields (temperature, rot) made
+            // untouched tiles look changed.
+            const std::string items_sig = mp_ground_items_sig( m, bub );
+            if( !items_sig.empty() ) {
                 ++n_with_items;
-                items_json = "[";
-                bool ifirst = true;
-                for( const item &it : items ) {
-                    ++n_items_serialized;
-                    const std::string item_json = serialize( it );
-                    items_sig += item_json + ',';
-                    if( !ifirst ) {
-                        items_json += ',';
-                    }
-                    ifirst = false;
-                    items_json += item_json;
-                }
-                items_json += "]";
             }
 
             const auto ts_d = tsclk::now();
@@ -18279,6 +18385,21 @@ static std::string build_tile_changes( const tripoint_abs_ms &center, int radius
             if( ter_furn_changed ) {
                 ++dbg_delta_terfurn;
             }
+
+            // Full item list for the tile being sent (the client rebases on it).
+            std::string items_json = "[";
+            {
+                bool ifirst = true;
+                for( const item &it : m.i_at( bub ) ) {
+                    ++n_items_serialized;
+                    if( !ifirst ) {
+                        items_json += ',';
+                    }
+                    ifirst = false;
+                    items_json += serialize( it );
+                }
+            }
+            items_json += "]";
 
             if( !first ) {
                 out += ',';
@@ -18805,6 +18926,165 @@ static std::string build_monster_list( const tripoint_abs_ms &center, int radius
 }
 
 // Client: apply terrain, furniture, and item changes received from the server.
+// Client: install the host's list for one tile, keeping this client's own
+// changes the host has not seen yet (GROUND-ITEM SYNC, see
+// g_client_ground_baseline).  Runs now, or later when a menu that holds item
+// references closes — it reads the tile as it is at that moment, so a pickup or
+// drop made while the menu was open survives a host list that predates it
+// (the old whole-list replace put a just-picked-up item back on the ground,
+// and the next scan then shipped it to the host: a duplicate on both sides).
+//   * local change since the last agreement (new item, or same uid with a
+//     different stable sig): kept as it is locally; the next scan reports it;
+//   * local removal not reported yet: kept off; the next scan reports it;
+//   * reported removal the host list still shows: kept off until the host
+//     catches up (or MP_GROUND_PENDING_MAX lists pass — then the host wins);
+//   * reported add the host list does not show yet: kept, likewise.
+// The host's uids are put back on the copies (add_item draws fresh ones), so
+// the client's later removals name items the host can find.
+static void mp_client_rebase_ground( const tripoint_abs_ms &abs, std::vector<item> &host_items )
+{
+    map &m = get_map();
+    if( !m.inbounds( abs ) ) {
+        return;
+    }
+    const tripoint_bub_ms bub = m.get_bub( abs );
+    std::set<int64_t> host_uids;
+    for( const item &it : host_items ) {
+        host_uids.insert( it.uid().get_value() );
+    }
+
+    // Pending reports: confirmed by this list, still waiting, or expired.
+    const auto settle = [&]( std::unordered_map<tripoint_abs_ms, std::map<int64_t, int>> &pending,
+    bool confirmed_when_listed ) {
+        std::set<int64_t> waiting;
+        const auto pit = pending.find( abs );
+        if( pit == pending.end() ) {
+            return waiting;
+        }
+        for( auto it = pit->second.begin(); it != pit->second.end(); ) {
+            const bool listed = host_uids.count( it->first ) > 0;
+            if( listed == confirmed_when_listed ) {
+                it = pit->second.erase( it );            // host caught up
+            } else if( ++it->second > MP_GROUND_PENDING_MAX ) {
+                mp_log( "[cdda-mp] GROUND-PENDING-EXPIRED: uid=" + std::to_string( it->first ) +
+                        ( confirmed_when_listed ? " add" : " removal" ) +
+                        " never confirmed by the host — host list wins" );
+                it = pit->second.erase( it );
+            } else {
+                waiting.insert( it->first );
+                ++it;
+            }
+        }
+        if( pit->second.empty() ) {
+            pending.erase( pit );
+        }
+        return waiting;
+    };
+    const std::set<int64_t> waiting_rem = settle( g_client_ground_pending_rem, false );
+    const std::set<int64_t> waiting_add = settle( g_client_ground_pending_add, true );
+
+    // This client's own changes since the last agreement.
+    std::set<int64_t> local_removed;
+    std::vector<std::pair<int64_t, item>> keep;      // local items to keep as they are
+    std::set<int64_t> keep_uids;
+    std::map<int64_t, std::string> new_base;
+    const auto bit = g_client_ground_baseline.find( abs );
+    if( bit != g_client_ground_baseline.end() ) {
+        const std::map<int64_t, std::string> &base = bit->second;
+        std::set<int64_t> cur_uids;
+        for( const item &it : m.i_at( bub ) ) {
+            const int64_t u = it.uid().get_value();
+            cur_uids.insert( u );
+            const auto b = base.find( u );
+            const bool local_change = b == base.end() || b->second != mp_item_stable_sig( it );
+            const bool unconfirmed_add = waiting_add.count( u ) && !host_uids.count( u );
+            if( local_change || unconfirmed_add ) {
+                keep.emplace_back( u, it );
+                keep_uids.insert( u );
+                if( unconfirmed_add && !local_change ) {
+                    // Already reported: in the baseline, so it isn't sent again.
+                    new_base[u] = b->second;
+                }
+            }
+        }
+        for( const auto &[u, sig] : base ) {
+            if( !cur_uids.count( u ) && !waiting_rem.count( u ) ) {
+                local_removed.insert( u );
+            }
+        }
+    }
+
+    // Nothing to do when the tile already holds exactly what the rebase would
+    // leave (the usual case: the host echoing back a change this client made).
+    // Skipping the clear keeps item references held by a running activity
+    // (butchering the corpse on this tile, say) valid.
+    {
+        std::map<int64_t, std::string> want;
+        for( const item &it : host_items ) {
+            const int64_t u = it.uid().get_value();
+            if( !waiting_rem.count( u ) && !local_removed.count( u ) && !keep_uids.count( u ) ) {
+                want[u] = mp_item_stable_sig( it );
+            }
+        }
+        for( const auto &[u, it] : keep ) {
+            want[u] = mp_item_stable_sig( it );
+        }
+        std::map<int64_t, std::string> have;
+        size_t n_have = 0;
+        for( const item &it : m.i_at( bub ) ) {
+            have[it.uid().get_value()] = mp_item_stable_sig( it );
+            ++n_have;
+        }
+        if( have == want && n_have == want.size() ) {
+            for( const item &it : host_items ) {
+                const int64_t u = it.uid().get_value();
+                if( !waiting_rem.count( u ) ) {
+                    new_base[u] = mp_item_stable_sig( it );
+                }
+            }
+            g_client_ground_baseline[abs] = std::move( new_base );
+            return;
+        }
+    }
+
+    m.i_clear( bub );
+    int placed_host = 0;
+    for( item &it : host_items ) {
+        const int64_t u = it.uid().get_value();
+        if( waiting_rem.count( u ) ) {
+            continue;   // already reported taken; the host hasn't caught up
+        }
+        // Agreed state = the host's.  Includes items this client took or
+        // changed but hasn't reported, so the next scan reports exactly that.
+        new_base[u] = mp_item_stable_sig( it );
+        if( local_removed.count( u ) || keep_uids.count( u ) ) {
+            continue;
+        }
+        item &placed = m.add_item( bub, std::move( it ) );
+        if( !placed.is_null() && u > 0 ) {
+            placed.set_uid( u );
+        }
+        ++placed_host;
+    }
+    for( auto &[u, it] : keep ) {
+        item &placed = m.add_item( bub, std::move( it ) );
+        if( !placed.is_null() && u > 0 ) {
+            placed.set_uid( u );
+        }
+    }
+    g_client_ground_baseline[abs] = std::move( new_base );
+    if( !keep.empty() || !local_removed.empty() || !waiting_rem.empty() ) {
+        mp_log( "[cdda-mp] GROUND-REBASE: @" + std::to_string( abs.x() ) + "," +
+                std::to_string( abs.y() ) + "," + std::to_string( abs.z() ) +
+                " host=" + std::to_string( host_items.size() ) +
+                " placed=" + std::to_string( placed_host ) +
+                " kept_local=" + std::to_string( keep.size() ) +
+                " local_removed=" + std::to_string( local_removed.size() ) +
+                " pending_rem=" + std::to_string( waiting_rem.size() ) +
+                " pending_add=" + std::to_string( waiting_add.size() ) );
+    }
+}
+
 static void apply_tile_changes( JsonObject &jo )
 {
     if( !jo.has_array( "tile_changes" ) ) {
@@ -18858,14 +19138,12 @@ static void apply_tile_changes( JsonObject &jo )
         }
 
         if( to.has_array( "items" ) ) {
-            // Ground-item apply = i_clear()+rebuild (REPLACE): mirror of the
-            // host-side path.  The 2026-07-11 UID-diff (c8cd48032e) broke this —
-            // item_uid regenerates on add_item's copy so the dedup never matched
-            // and only ever ADDED, ballooning tiles to thousands of items and
-            // stalling the client (issue #17/#18).  Replace can't accumulate.
-            // If the client's own pickup/examine/AIM UI is open on this exact
-            // tile, defer the replace until it closes — see mp_ui_item_ref_guard
-            // in mp_gamestate.h.
+            // Ground items: the host's full list, installed by rebasing this
+            // client's own unreported changes on top (mp_client_rebase_ground).
+            // If the client's own pickup/examine/AIM/inventory UI holds item
+            // references, the rebase waits until it closes — see
+            // mp_ui_item_ref_guard in mp_gamestate.h — and then reads the tile
+            // as it is at that moment.
             std::vector<item> new_items;
             std::string applied;
             for( const JsonValue &iv : to.get_array( "items" ) ) {
@@ -18893,17 +19171,15 @@ static void apply_tile_changes( JsonObject &jo )
                     }
                 } catch( const JsonError & ) {}
             }
-            auto do_replace = [bub, items = std::move( new_items )]() mutable {
-                map &m2 = get_map();
-                m2.i_clear( bub );
-                for( item &it : items ) {
-                    m2.add_item( bub, std::move( it ) );
-                }
+            // Captures the absolute position, not bub: a deferred apply can run
+            // after the client's map has shifted.
+            auto do_rebase = [abs, items = std::move( new_items )]() mutable {
+                mp_client_rebase_ground( abs, items );
             };
             if( mp_ui_holds_item_refs() ) {
-                mp_defer_item_apply( std::move( do_replace ) );
+                mp_defer_item_apply( std::move( do_rebase ) );
             } else {
-                do_replace();
+                do_rebase();
             }
             if( !applied.empty() ) {
                 mp_log( "[cdda-mp] apply_tile_changes: set items @ " +
@@ -18992,11 +19268,8 @@ static void apply_tile_changes( JsonObject &jo )
             const furn_id &cur_furn = m.furn( bub );
             g_client_terfurn_baseline[abs] = cur_ter.id().str() + '|' + cur_furn.id().str();
 
-            std::string cur_items_sig;
-            for( const item &it : m.i_at( bub ) ) {
-                cur_items_sig += serialize( it ) + ',';
-            }
-            g_client_item_baseline[abs] = cur_items_sig;
+            // Items: the agreed baseline is set by mp_client_rebase_ground(),
+            // when the host's list is actually installed.
 
             std::string cur_fields_sig;
             const field &cur_fld = m.field_at( bub );
@@ -21045,7 +21318,7 @@ std::string serialize_remote_player_state( bool skip_tile_scan )
     // (~120ms), never dropped, because build_tile_changes() diffs against the
     // persistent g_tile_baseline rather than against "what happened since the last
     // scan".
-    std::string tile_changes = skip_tile_scan ? "[]" : build_tile_changes( pos, 20 );
+    std::string tile_changes = skip_tile_scan ? "[]" : build_tile_changes( pos, 20, pos );
     {
         // Radius-20 scan = ~1681 tiles, each computing item/field/trap/graffiti
         // signatures. Suspect for the 120ms grant cost; measure rather than assume.
@@ -21068,7 +21341,7 @@ std::string serialize_remote_player_state( bool skip_tile_scan )
         }
     };
     if( !skip_tile_scan && host_pos != pos ) {
-        merge_tile_changes( build_tile_changes( host_pos, 20 ) );
+        merge_tile_changes( build_tile_changes( host_pos, 20, pos ) );
     }
     // Also stream the levels directly overhead (the roof, and whatever's above
     // it) at both positions. The client runs its own local worldgen for the
@@ -21088,10 +21361,10 @@ std::string serialize_remote_player_state( bool skip_tile_scan )
     static constexpr int ROOF_SYNC_LEVELS = 3;
     for( int dz = 1; !skip_tile_scan && dz <= ROOF_SYNC_LEVELS; ++dz ) {
         merge_tile_changes( build_tile_changes(
-                                 tripoint_abs_ms( pos.x(), pos.y(), pos.z() + dz ), 20 ) );
+                                 tripoint_abs_ms( pos.x(), pos.y(), pos.z() + dz ), 20, pos ) );
         if( host_pos != pos ) {
             merge_tile_changes( build_tile_changes(
-                                     tripoint_abs_ms( host_pos.x(), host_pos.y(), host_pos.z() + dz ), 20 ) );
+                                     tripoint_abs_ms( host_pos.x(), host_pos.y(), host_pos.z() + dz ), 20, pos ) );
         }
     }
 

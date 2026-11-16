@@ -324,6 +324,14 @@ void mp_pre_remove_dead();
 // next sync culled 32 mon_zombie(local).  False outside client mode.
 bool mp_client_skips_corpse_revival();
 
+// Client: true when monster::die must leave no corpse, splatter or drops in the
+// client's world, because `mon` is a copy of a host-owned monster (mp_net_id set).
+// The host's own die() makes the real corpse and loot, which arrive through tile
+// sync.  Before this, a monster the client killed got two corpses: the client's
+// copy rode its tile changes to the host, then the host's die() added its own.
+// False outside client mode and for client-local monsters (mp_net_id == 0).
+bool mp_client_skips_death_items( const monster &mon );
+
 // Client: general guard for the red/red deadlock class.  Called from do_turn's
 // locked branch, just before the blocking handle_action(), i.e. when the client
 // sits at its top-level prompt with moves <= 0 and no activity.  If the newest

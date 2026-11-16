@@ -3190,9 +3190,24 @@ void monster::die( map *here, Creature *nkiller )
 
     item_location corpse;
 
+    // MP: a client's copy of a host-owned monster leaves nothing on the ground.
+    // The host runs the same death in its own world and its corpse and loot
+    // reach the client through tile sync.  Dropping them here as well put a
+    // second corpse (and a second roll of loot) into the shared world: the
+    // client's tile delta carried its copy to the host, and the host's own
+    // die() added another.  The death message is still shown locally.
+    const bool mp_copy_no_items = cata_mp::mp_client_skips_death_items( *this );
+    // Death drops for THIS world only; the member itself is left as the host's
+    // diff/log code reads it (banishment = death_drops false).
+    const bool local_drops = death_drops && !mp_copy_no_items;
+    if( mp_copy_no_items && !no_corpse_quiet && !quiet_death &&
+        !has_flag( mon_flag_QUIETDEATH ) ) {
+        add_msg_if_player_sees( *this, m_good, _( "The %s dies!" ), name() );
+    }
+
     // If this monster dies underwater in swim-under terrain and is aquatic (fish),
     // do not create a corpse on the tile (prevent corpse drop).
-    bool suppress_corpse = false;
+    bool suppress_corpse = mp_copy_no_items;
     if( here != nullptr ) {
         const tripoint_bub_ms death_pos = pos_bub( *here );
         if( here->has_flag( ter_furn_flag::TFLAG_SWIM_UNDER, death_pos ) && is_underwater() &&
@@ -3217,7 +3232,7 @@ void monster::die( map *here, Creature *nkiller )
         }
     }
 
-    if( death_drops ) {
+    if( local_drops ) {
         // Drop items stored in optionals
         move_special_item_to_inv( tack_item );
         move_special_item_to_inv( armor_item );
@@ -3233,13 +3248,13 @@ void monster::die( map *here, Creature *nkiller )
         }
     }
 
-    if( death_drops ) {
+    if( local_drops ) {
         if( !no_extra_death_drops ) {
             drop_items_on_death( here, corpse.get_item() );
         }
         spawn_dissectables_on_death( corpse.get_item() );
     }
-    if( death_drops && !is_hallucination() ) {
+    if( local_drops && !is_hallucination() ) {
         for( const item &it : inv ) {
             if( it.has_var( "DESTROY_ITEM_ON_MON_DEATH" ) ) {
                 continue;
