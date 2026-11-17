@@ -438,7 +438,13 @@ void mp_do_turn_update_body( Character &u )
     // the host-synced date settles in, can *also* look like a huge same-
     // session jump to the very next call. Regardless of cause, update_body()
     // must never be allowed to fast-forward needs across an unbounded span.
-    constexpr int MAX_BODY_CATCHUP_TURNS = 100;
+    // 2026-11-17: was 100 turns.  That also cut off ordinary play: a client
+    // idle while the host plays sees the clock jump a few hundred turns, and
+    // got ONE turn of update_body for it — no stamina regen for the rest, so
+    // stamina only ever went down (log: 8:00:14 -> 8:03:48, 214 turns, applied
+    // 1; earlier session drift=-100).  Hunger/thirst/healing lagged the same
+    // way.  A day still stops the mid-join bogus jumps (those span months).
+    constexpr int MAX_BODY_CATCHUP_TURNS = 24 * 60 * 60;
     if( s_last_update_body != calendar::before_time_starts &&
         calendar::turn > s_last_update_body &&
         to_turns<int>( calendar::turn - s_last_update_body ) <= MAX_BODY_CATCHUP_TURNS ) {
